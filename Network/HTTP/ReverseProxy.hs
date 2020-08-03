@@ -16,6 +16,7 @@ module Network.HTTP.ReverseProxy
     , waiProxyTo
     , defaultOnExc
     , waiProxyToSettings
+    , waiProxyToSettingsX
     , WaiProxyResponse (..)
       -- ** Settings
     , WaiProxySettings
@@ -173,6 +174,9 @@ data WaiProxyResponse = WPRResponse WAI.Response
                         -- request. This can be useful for reverse proxying to
                         -- a different path than the one specified. By the
                         -- user.
+                        -- The path will be taken from rawPathInfo while
+                        -- the queryString from rawQueryString of the
+                        -- request.
                         --
                         -- Since 0.2.0
                       | WPRModifiedRequestSecure WAI.Request ProxyDest
@@ -419,6 +423,101 @@ waiProxyToSettings getDest wps' manager req0 sendResponse = do
                                     Flush -> flush
                                     Chunk b -> sendChunk b))
 
+bracketX
+  :: IO (Either SomeException (HC.Response BodyReader))
+     -> (Either SomeException (HC.Response BodyReader) -> IO ())
+     -> (Either SomeException (HC.Response BodyReader)
+         -> IO WAI.ResponseReceived)
+     -> IO WAI.ResponseReceived
+bracketX = bracket
+
+-- | version of 'waiProxyToSettings' that allocate an http client manager for every
+-- single request ... ugh.
+--
+-- However, if we share an http client manager across requests, we intermittently
+-- seem to get WrongRequestBodyStreamSize exceptions: the actual body size got
+-- ends up being zero (presumably due to some exception or fuckup in the http
+-- client manager corrupting later requests), and the difference between the two
+-- means a WrongRequestBodyStreamSize gets thrown (we can catch it here, but
+-- that doesn't really do us any good, the request already failed).
+--
+-- TODO: tidy up.
+waiProxyToSettingsX :: (WAI.Request -> IO WaiProxyResponse)
+                   -> WaiProxySettings
+                   -> HC.Manager
+                   -> WAI.Application
+waiProxyToSettingsX getDest wps' _manager req0 sendResponse = do
+
+    let wps = wps'{wpsGetDest = wpsGetDest wps' <|> Just (fmap (LocalWaiProxySettings $ wpsTimeout wps',) . getDest)}
+    (lps, edest') <- fromMaybe
+        (const $ return (defaultLocalWaiProxySettings, WPRResponse $ WAI.responseLBS HT.status500 [] "proxy not setup"))
+        (wpsGetDest wps)
+        req0
+    let edest =
+            case edest' of
+                WPRResponse res -> Left $ \_req -> ($ res)
+                WPRProxyDest pd -> Right (pd, req0, False)
+                WPRProxyDestSecure pd -> Right (pd, req0, True)
+                WPRModifiedRequest req pd -> Right (pd, req, False)
+                WPRModifiedRequestSecure req pd -> Right (pd, req, True)
+                WPRApplication app -> Left app
+        timeBound us f =
+            timeout us f >>= \case
+                Just res -> return res
+                Nothing -> sendResponse $ WAI.responseLBS HT.status500 [] "timeBound"
+    case edest of
+        Left app -> maybe id timeBound (lpsTimeBound lps) $ app req0 sendResponse
+        Right (ProxyDest host port, req, secure) -> tryWebSockets wps host port req sendResponse $ do
+            let req' =
+#if MIN_VERSION_http_client(0, 5, 0)
+                  HC.defaultRequest
+                    { HC.checkResponse = \_ _ -> return ()
+                    , HC.responseTimeout = maybe HC.responseTimeoutNone HC.responseTimeoutMicro $ lpsTimeBound lps
+#else
+                  def
+                    { HC.checkStatus = \_ _ _ -> Nothing
+                    , HC.responseTimeout = lpsTimeBound lps
+#endif
+                    , HC.method = WAI.requestMethod req
+                    , HC.secure = secure
+                    , HC.host = host
+                    , HC.port = port
+                    , HC.path = WAI.rawPathInfo req
+                    , HC.queryString = WAI.rawQueryString req
+                    , HC.requestHeaders = fixReqHeaders wps req
+                    , HC.requestBody = body
+                    , HC.redirectCount = 0
+                    }
+                body =
+                    case WAI.requestBodyLength req of
+                        WAI.KnownLength i -> HC.RequestBodyStream
+                            (fromIntegral i)
+                            ($ WAI.requestBody req)
+                        WAI.ChunkedBody -> HC.RequestBodyStreamChunked ($ WAI.requestBody req)
+
+            bracketX
+                (
+                  let --a = try $ HC.responseOpen req' manager
+                      b = try $ HC.withManager HC.defaultManagerSettings $ HC.responseOpen req'
+                  in  b
+                )
+                (either (const $ return ()) HC.responseClose)
+                $ \case
+                    Left e -> wpsOnExc wps e req sendResponse
+                    Right res -> do
+                        let conduit = fromMaybe
+                                        (awaitForever (\bs -> yield (Chunk $ fromByteString bs) >> yield Flush))
+                                        (wpsProcessBody wps req $ const () <$> res)
+                            src = bodyReaderSource $ HC.responseBody res
+                        sendResponse $ WAI.responseStream
+                            (HC.responseStatus res)
+                            (filter (\(key, _) -> not $ key `Set.member` strippedHeaders) $ HC.responseHeaders res)
+                            (\sendChunk flush -> runConduit $ src .| conduit .| CL.mapM_ (\mb ->
+                                case mb of
+                                    Flush -> flush
+                                    Chunk b -> sendChunk b))
+
+
 -- | Get the HTTP headers for the first request on the stream, returning on
 -- consumed bytes as leftovers. Has built-in limits on how many bytes it will
 -- consume (specifically, will not ask for another chunked after it receives
@@ -493,3 +592,4 @@ bodyReaderSource br =
         unless (S.null bs) $ do
             yield bs
             loop
+
