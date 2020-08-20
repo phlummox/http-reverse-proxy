@@ -65,12 +65,12 @@ import           Data.Word8                     (isSpace, _colon, _cr)
 import           GHC.Generics                   (Generic)
 import           Network.HTTP.Client            (BodyReader, brRead)
 import qualified Network.HTTP.Client            as HC
+import qualified Network.HTTP.Client.TLS        as HCS
 import qualified Network.HTTP.Types             as HT
 import qualified Network.Wai                    as WAI
 import           Network.Wai.Logger             (showSockAddr)
 import           UnliftIO                       (MonadIO, liftIO, MonadUnliftIO, timeout, SomeException, try, bracket, concurrently_)
 
-import Network.HTTP.Client.TLS as HCS
 
 -- | Host\/port combination to which we want to proxy.
 data ProxyDest = ProxyDest
@@ -499,11 +499,7 @@ waiProxyToSettingsX getDest wps' _manager req0 sendResponse = do
 
             bracketX
                 (
-                  let --a = try $ HC.responseOpen req' manager
-                      --b = try $ HC.withManager HC.defaultManagerSettings $ HC.responseOpen req'
-                      --b = try $ HC.newManager HC.defaultManagerSettings >>= HC.responseOpen req'
-                      b = try $ HCS.newTlsManager >>= HC.responseOpen req'
-                  in  b
+                  try $ HCS.newTlsManager >>= HC.responseOpen req'
                 )
                 (either (const $ return ()) HC.responseClose)
                 $ \case
